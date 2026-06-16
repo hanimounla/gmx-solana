@@ -58,3 +58,6 @@ serde = { workspace = true, features = ["derive"], optional = true }
 [package.metadata.docs.rs]
 features = ["doc"]
 rustdoc-args = ["--cfg", "docsrs"]
+
+[lints]
+workspace = true

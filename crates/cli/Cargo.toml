@@ -86,3 +86,6 @@ gql_client = { workspace = true, optional = true }
 [build-dependencies]
 vergen-git2 = { workspace = true, features = ["build", "cargo", "rustc"] }
 anyhow = { workspace = true }
+
+[lints]
+workspace = true

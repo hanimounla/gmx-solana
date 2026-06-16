@@ -60,3 +60,6 @@ time = { workspace = true }
 [[test]]
 name = "anchor"
 path = "anchor.rs"
+
+[lints]
+workspace = true

@@ -34,3 +34,6 @@ anchor-lang = { workspace = true }
 gmsol-callback = { workspace = true, features = ["interface", "display"] }
 gmsol-programs = { workspace = true }
 gmsol-utils = { workspace = true, features = ["security-txt"] }
+
+[lints]
+workspace = true

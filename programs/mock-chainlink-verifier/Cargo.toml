@@ -38,3 +38,6 @@ cfg-if = { workspace = true }
 [package.metadata.docs.rs]
 features = ["doc"]
 rustdoc-args = ["--cfg", "docsrs"]
+
+[lints]
+workspace = true

@@ -43,3 +43,6 @@ gmsol-model = { path = ".", features = ["test", "u128"] }
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
+
+[lints]
+workspace = true

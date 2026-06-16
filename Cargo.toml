@@ -180,6 +180,10 @@ path = "crates/programs"
 version = "0.11.0"
 path = "crates/sdk"
 
+[workspace.lints.rust]
+mismatched_lifetime_syntaxes = "allow"
+unexpected_cfgs = "allow"
+
 [profile.release]
 overflow-checks = true
 lto = "fat"
