@@ -1,0 +1,146 @@
+###############################################################################
+# GitHub Actions — Docker Build + ECR Push
+#
+# Triggers:
+#   • Push to main → build + push all service images to ECR (staging tag)
+#   • Git tag v* → build + push with semver tag (for prod deploys)
+#   • PR → build only (no push) to validate Dockerfile
+###############################################################################
+
+name: Docker
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "infra/docker/**"
+      - "crates/**"
+      - "programs/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+  pull_request:
+    paths:
+      - "infra/docker/**"
+      - "crates/**"
+  release:
+    types: [published]
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: "us-east-1"
+  RUST_VERSION: "1.87"
+
+jobs:
+  ###########################################################################
+  # Build keeper image
+  ###########################################################################
+  build-keeper:
+    name: "Build keeper image"
+    runs-on: ubuntu-latest-8-cores  # Faster Rust compilation
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: |
+            image=moby/buildkit:v0.15.0
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_STAGING_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Compute tags
+        id: tags
+        run: |
+          ECR_REGISTRY=${{ steps.login-ecr.outputs.registry }}
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-8)
+          echo "registry=$ECR_REGISTRY" >> $GITHUB_OUTPUT
+          echo "sha_tag=$ECR_REGISTRY/gmsol/keeper:sha-$SHORT_SHA" >> $GITHUB_OUTPUT
+          echo "latest_tag=$ECR_REGISTRY/gmsol/keeper:latest" >> $GITHUB_OUTPUT
+          if [[ "${{ github.event_name }}" == "release" ]]; then
+            echo "version_tag=$ECR_REGISTRY/gmsol/keeper:${{ github.event.release.tag_name }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Build + Push (on main/tag)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: infra/docker/keeper/Dockerfile
+          platforms: linux/amd64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: |
+            ${{ steps.tags.outputs.sha_tag }}
+            ${{ steps.tags.outputs.latest_tag }}
+            ${{ steps.tags.outputs.version_tag }}
+          cache-from: type=registry,ref=${{ steps.tags.outputs.registry }}/gmsol/keeper:cache
+          cache-to: type=registry,ref=${{ steps.tags.outputs.registry }}/gmsol/keeper:cache,mode=max
+          build-args: |
+            BIN_NAME=gmsol-keeper
+            RUST_VERSION=${{ env.RUST_VERSION }}
+
+      - name: ECR Vulnerability Scan
+        if: github.event_name != 'pull_request'
+        run: |
+          aws ecr wait image-scan-complete \
+            --repository-name gmsol/keeper \
+            --image-id imageTag=sha-${{ github.sha }}
+          FINDINGS=$(aws ecr describe-image-scan-findings \
+            --repository-name gmsol/keeper \
+            --image-id imageTag=sha-${{ github.sha }} \
+            --query 'imageScanFindings.findingSeverityCounts' \
+            --output json)
+          echo "Scan findings: $FINDINGS"
+          CRITICAL=$(echo "$FINDINGS" | jq '.CRITICAL // 0')
+          if [ "$CRITICAL" -gt "0" ]; then
+            echo "::error::ECR scan found $CRITICAL CRITICAL vulnerabilities"
+            exit 1
+          fi
+
+  ###########################################################################
+  # Rolling restart keepers after new image push
+  ###########################################################################
+  deploy-staging:
+    name: "Deploy to Staging"
+    runs-on: ubuntu-latest
+    needs: [build-keeper]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    environment: staging
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_STAGING_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --region ${{ env.AWS_REGION }} --name gmsol-staging
+
+      - name: Rolling restart keepers
+        run: |
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-8)
+          ECR_REGISTRY=$(aws ecr describe-registry --query registryId --output text).dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com
+          NEW_IMAGE="$ECR_REGISTRY/gmsol/keeper:sha-$SHORT_SHA"
+
+          for deployment in keeper-order keeper-liquidator keeper-adl keeper-glv price-cache-daemon; do
+            kubectl set image deployment/$deployment \
+              ${deployment%-*}=$NEW_IMAGE \
+              -n gmsol || true
+          done
+
+          kubectl rollout status deployment/keeper-order -n gmsol --timeout=5m
+          kubectl rollout status deployment/keeper-liquidator -n gmsol --timeout=5m
+          kubectl rollout status deployment/price-cache-daemon -n gmsol --timeout=5m

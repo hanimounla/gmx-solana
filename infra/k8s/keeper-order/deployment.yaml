@@ -1,0 +1,189 @@
+###############################################################################
+# Keeper Order Executor
+#
+# Responsibilities:
+#   - Watch Solana for pending Order PDAs (via WebSocket + GPA fallback poll)
+#   - Priority: Liquidations > Market Orders > Deposits/Withdrawals > Limit Orders
+#   - Fetch signed prices from price-cache-daemon (Redis)
+#   - Build + submit execution transactions via JITO bundle submission
+#   - Emit structured metrics to CloudWatch
+#
+# NOTE: ON_DEMAND nodes only — spot interruptions cause missed order executions.
+###############################################################################
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: keeper-order
+  namespace: gmsol
+  annotations:
+    # IRSA — allows this pod to get AWS credentials via IAM role
+    eks.amazonaws.com/role-arn: "${IRSA_KEEPER_ORDER_ROLE_ARN}"
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: keeper-order-config
+  namespace: gmsol
+data:
+  RUST_LOG: "info,gmsol_keeper=debug"
+  SOLANA_CLUSTER: "mainnet"
+  SOLANA_RPC_URL: "https://mainnet.helius-rpc.com" # Overridden at runtime with API key
+  STORE_PROGRAM_ID: "Gmso1uvJnLbawvw7yezdfCDcPydwW2s2iqG3w6MDucLo"
+  TREASURY_PROGRAM_ID: "GTuvYD5SxkTq4FLG6JV1FQ5dkczr1AfgDcBHaFsBdtBg"
+  TIMELOCK_PROGRAM_ID: "TimeBQ7gQyWyQMD3bTteAdy7hTVDNWSwELdSVZHfSXL"
+  # GPA poll interval (fallback when WebSocket drops)
+  GPA_POLL_INTERVAL_SECS: "15"
+  # Price freshness requirement (must be < 30s per oracle constraint)
+  MAX_PRICE_AGE_SECS: "25"
+  # JITO tip in lamports (increase during congestion)
+  JITO_TIP_LAMPORTS: "10000"
+  # Throw on execution error for limit orders (keep pending, don't cancel)
+  LIMIT_ORDER_THROW_ON_ERROR: "true"
+  # CloudWatch custom metrics namespace
+  METRICS_NAMESPACE: "gmsol/keeper"
+  AWS_REGION: "us-east-1"
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: keeper-order
+  namespace: gmsol
+  labels:
+    app: keeper-order
+    component: keeper
+spec:
+  replicas: 1  # Single instance — chain is idempotent, Redis lock prevents double execution
+  strategy:
+    type: Recreate  # Not RollingUpdate — we want one instance at a time
+  selector:
+    matchLabels:
+      app: keeper-order
+  template:
+    metadata:
+      labels:
+        app: keeper-order
+        component: keeper
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+    spec:
+      serviceAccountName: keeper-order
+      terminationGracePeriodSeconds: 60  # Allow in-flight transactions to complete
+
+      # Schedule on keeper node group only
+      nodeSelector:
+        role: keepers
+
+      tolerations:
+        - key: "dedicated"
+          operator: "Equal"
+          value: "keepers"
+          effect: "NoSchedule"
+
+      # Init container: fetch secrets from Secrets Manager into /secrets
+      initContainers:
+        - name: fetch-secrets
+          image: amazon/aws-cli:latest
+          command:
+            - sh
+            - -c
+            - |
+              aws secretsmanager get-secret-value \
+                --secret-id gmsol/keeper/order-keypair \
+                --query SecretString \
+                --output text > /secrets/keypair.json && \
+              aws secretsmanager get-secret-value \
+                --secret-id gmsol/rpc/helius-api-key \
+                --query SecretString \
+                --output text | jq -r '.api_key' > /secrets/rpc-api-key && \
+              aws secretsmanager get-secret-value \
+                --secret-id gmsol/rpc/jito-auth-keypair \
+                --query SecretString \
+                --output text > /secrets/jito-keypair.json
+          volumeMounts:
+            - name: secrets
+              mountPath: /secrets
+
+      containers:
+        - name: keeper-order
+          image: "${ECR_REGISTRY}/gmsol/keeper:latest"
+          imagePullPolicy: Always
+          command: ["gmsol-keeper", "order"]
+
+          envFrom:
+            - configMapRef:
+                name: keeper-order-config
+
+          env:
+            - name: KEEPER_KEYPAIR_PATH
+              value: /secrets/keypair.json
+            - name: JITO_KEYPAIR_PATH
+              value: /secrets/jito-keypair.json
+            - name: SOLANA_RPC_API_KEY_PATH
+              value: /secrets/rpc-api-key
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: redis-connection
+                  key: url
+
+          resources:
+            requests:
+              cpu: "1000m"
+              memory: "1Gi"
+            limits:
+              cpu: "2000m"
+              memory: "2Gi"
+
+          volumeMounts:
+            - name: secrets
+              mountPath: /secrets
+              readOnly: true
+
+          # Liveness: process is alive
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 9090
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            failureThreshold: 3
+
+          # Readiness: keeper has connected to Solana and Redis
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 9090
+            initialDelaySeconds: 15
+            periodSeconds: 10
+
+          securityContext:
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 1000
+            allowPrivilegeEscalation: false
+
+      volumes:
+        - name: secrets
+          emptyDir:
+            medium: Memory  # Never write keypairs to disk
+
+      securityContext:
+        fsGroup: 1000
+
+---
+# PodDisruptionBudget: ensure at least 1 replica during node upgrades
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: keeper-order-pdb
+  namespace: gmsol
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: keeper-order

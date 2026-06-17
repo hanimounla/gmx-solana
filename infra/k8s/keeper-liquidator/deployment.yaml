@@ -1,0 +1,161 @@
+###############################################################################
+# Keeper Liquidator
+#
+# Responsibilities:
+#   - Continuously scans ALL active Position PDAs on Solana
+#   - Calculates position health off-chain using gmsol-model math
+#     (includes borrowing fees, funding fees, price impact)
+#   - Triggers liquidation via `liquidate` instruction when health < threshold
+#   - Bundles escrow account creation + position_cut in same transaction
+#     (avoids frozen token account race condition per KEEPER_PROPOSAL)
+###############################################################################
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: keeper-liquidator
+  namespace: gmsol
+  annotations:
+    eks.amazonaws.com/role-arn: "${IRSA_KEEPER_LIQUIDATOR_ROLE_ARN}"
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: keeper-liquidator-config
+  namespace: gmsol
+data:
+  RUST_LOG: "info,gmsol_keeper=debug"
+  SOLANA_CLUSTER: "mainnet"
+  STORE_PROGRAM_ID: "Gmso1uvJnLbawvw7yezdfCDcPydwW2s2iqG3w6MDucLo"
+  # Scan all positions every 5 seconds
+  POSITION_SCAN_INTERVAL_SECS: "5"
+  # Health factor threshold below which we liquidate (same math as on-chain)
+  LIQUIDATION_HEALTH_THRESHOLD: "1.0"
+  # Use price cache — don't fetch prices inline (avoids blocking during scan)
+  USE_PRICE_CACHE: "true"
+  MAX_PRICE_AGE_SECS: "25"
+  JITO_TIP_LAMPORTS: "50000"  # Higher tip for liquidations — priority execution
+  METRICS_NAMESPACE: "gmsol/keeper"
+  AWS_REGION: "us-east-1"
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: keeper-liquidator
+  namespace: gmsol
+  labels:
+    app: keeper-liquidator
+    component: keeper
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: keeper-liquidator
+  template:
+    metadata:
+      labels:
+        app: keeper-liquidator
+        component: keeper
+    spec:
+      serviceAccountName: keeper-liquidator
+      terminationGracePeriodSeconds: 30
+      nodeSelector:
+        role: keepers
+
+      initContainers:
+        - name: fetch-secrets
+          image: amazon/aws-cli:latest
+          command:
+            - sh
+            - -c
+            - |
+              aws secretsmanager get-secret-value \
+                --secret-id gmsol/keeper/liquidator-keypair \
+                --query SecretString --output text > /secrets/keypair.json && \
+              aws secretsmanager get-secret-value \
+                --secret-id gmsol/rpc/helius-api-key \
+                --query SecretString --output text | jq -r '.api_key' > /secrets/rpc-api-key && \
+              aws secretsmanager get-secret-value \
+                --secret-id gmsol/rpc/jito-auth-keypair \
+                --query SecretString --output text > /secrets/jito-keypair.json
+          volumeMounts:
+            - name: secrets
+              mountPath: /secrets
+
+      containers:
+        - name: keeper-liquidator
+          image: "${ECR_REGISTRY}/gmsol/keeper:latest"
+          command: ["gmsol-keeper", "liquidator"]
+
+          envFrom:
+            - configMapRef:
+                name: keeper-liquidator-config
+
+          env:
+            - name: KEEPER_KEYPAIR_PATH
+              value: /secrets/keypair.json
+            - name: JITO_KEYPAIR_PATH
+              value: /secrets/jito-keypair.json
+            - name: SOLANA_RPC_API_KEY_PATH
+              value: /secrets/rpc-api-key
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: redis-connection
+                  key: url
+
+          resources:
+            requests:
+              cpu: "1500m"
+              memory: "2Gi"  # Higher memory — holds all position accounts in memory
+            limits:
+              cpu: "2000m"
+              memory: "3Gi"
+
+          volumeMounts:
+            - name: secrets
+              mountPath: /secrets
+              readOnly: true
+
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 9090
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            failureThreshold: 3
+
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 9090
+            initialDelaySeconds: 20
+            periodSeconds: 10
+
+          securityContext:
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 1000
+            allowPrivilegeEscalation: false
+
+      volumes:
+        - name: secrets
+          emptyDir:
+            medium: Memory
+
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: keeper-liquidator-pdb
+  namespace: gmsol
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: keeper-liquidator

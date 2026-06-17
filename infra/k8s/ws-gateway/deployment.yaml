@@ -1,0 +1,135 @@
+###############################################################################
+# WebSocket Gateway
+#
+# Serves real-time updates to frontend clients:
+#   • Market price streams
+#   • Position PnL updates
+#   • Order execution events (from Solana event logs)
+#
+# Scaled horizontally — stateless (events sourced from Redis pub/sub)
+###############################################################################
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ws-gateway
+  namespace: gmsol
+  labels:
+    app: ws-gateway
+    component: api
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app: ws-gateway
+  template:
+    metadata:
+      labels:
+        app: ws-gateway
+        component: api
+    spec:
+      nodeSelector:
+        role: api
+
+      containers:
+        - name: ws-gateway
+          image: "${ECR_REGISTRY}/gmsol/ws-gateway:latest"
+
+          env:
+            - name: RUST_LOG
+              value: "info"
+            - name: LISTEN_PORT
+              value: "8080"
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: redis-connection
+                  key: url
+            - name: AWS_REGION
+              value: "us-east-1"
+
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "256Mi"
+            limits:
+              cpu: "1000m"
+              memory: "1Gi"
+
+          ports:
+            - containerPort: 8080
+              name: http
+            - containerPort: 9090
+              name: metrics
+
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 9090
+            initialDelaySeconds: 10
+            periodSeconds: 15
+
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 9090
+            initialDelaySeconds: 5
+            periodSeconds: 5
+
+          securityContext:
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 1000
+            allowPrivilegeEscalation: false
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ws-gateway
+  namespace: gmsol
+  annotations:
+    # Registers this service with AWS Load Balancer Controller
+    service.beta.kubernetes.io/aws-load-balancer-type: "external"
+    service.beta.kubernetes.io/aws-load-balancer-target-group-arn: "${WS_TARGET_GROUP_ARN}"
+spec:
+  selector:
+    app: ws-gateway
+  ports:
+    - port: 8080
+      targetPort: 8080
+      protocol: TCP
+  type: ClusterIP
+
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: ws-gateway-hpa
+  namespace: gmsol
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: ws-gateway
+  minReplicas: 2
+  maxReplicas: 16
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 60
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 75

@@ -1,0 +1,237 @@
+###############################################################################
+# GitHub Actions — Terraform CI/CD
+#
+# Triggers:
+#   • PR → terraform fmt + validate + plan (plan posted as PR comment)
+#   • Push to main → terraform apply to STAGING automatically
+#   • Manual trigger → terraform apply to PROD (requires approval)
+###############################################################################
+
+name: Terraform
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "infra/terraform/**"
+  push:
+    branches: [main]
+    paths:
+      - "infra/terraform/**"
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Environment to apply (staging or prod)"
+        required: true
+        type: choice
+        options: [staging, prod]
+      action:
+        description: "Action to perform"
+        required: true
+        type: choice
+        options: [plan, apply, destroy]
+        default: plan
+
+permissions:
+  id-token: write     # OIDC for AWS auth
+  contents: read
+  pull-requests: write # For PR comments
+
+env:
+  TF_VERSION: "1.9.0"
+  AWS_REGION: "us-east-1"
+
+jobs:
+  ###########################################################################
+  # Validate + Format Check (runs on every PR)
+  ###########################################################################
+  validate:
+    name: "Terraform Validate"
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Format Check
+        run: terraform fmt -check -recursive infra/terraform/
+
+      - name: Configure AWS Credentials (staging role for validation)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_STAGING_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Terraform Init (staging)
+        working-directory: infra/terraform/environments/staging
+        run: terraform init -backend=true
+
+      - name: Terraform Validate
+        working-directory: infra/terraform/environments/staging
+        run: terraform validate
+
+  ###########################################################################
+  # Plan (runs on PR — posts plan as comment)
+  ###########################################################################
+  plan:
+    name: "Terraform Plan (${{ matrix.environment }})"
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    strategy:
+      matrix:
+        environment: [staging]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets[format('AWS_{0}_ROLE_ARN', matrix.environment)] }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Terraform Init
+        working-directory: infra/terraform/environments/${{ matrix.environment }}
+        run: terraform init
+
+      - name: Terraform Plan
+        id: plan
+        working-directory: infra/terraform/environments/${{ matrix.environment }}
+        run: |
+          terraform plan \
+            -var-file=terraform.tfvars \
+            -no-color \
+            -out=plan.tfplan \
+            2>&1 | tee plan-output.txt
+        env:
+          TF_VAR_db_master_password: ${{ secrets.DB_MASTER_PASSWORD }}
+          TF_VAR_redis_auth_token: ${{ secrets.REDIS_AUTH_TOKEN }}
+
+      - name: Post Plan as PR Comment
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const plan = fs.readFileSync('infra/terraform/environments/${{ matrix.environment }}/plan-output.txt', 'utf8');
+            const truncated = plan.length > 60000 ? plan.substring(0, 60000) + '\n\n... (truncated)' : plan;
+            const body = `## Terraform Plan — \`${{ matrix.environment }}\`\n\n\`\`\`hcl\n${truncated}\n\`\`\``;
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body
+            });
+
+      - name: Check Plan Status
+        if: steps.plan.outcome == 'failure'
+        run: exit 1
+
+  ###########################################################################
+  # Apply to Staging (auto on merge to main)
+  ###########################################################################
+  apply-staging:
+    name: "Apply Staging"
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    environment: staging
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_STAGING_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Terraform Init
+        working-directory: infra/terraform/environments/staging
+        run: terraform init
+
+      - name: Terraform Apply
+        working-directory: infra/terraform/environments/staging
+        run: |
+          terraform apply \
+            -var-file=terraform.tfvars \
+            -auto-approve \
+            -no-color
+        env:
+          TF_VAR_db_master_password: ${{ secrets.DB_MASTER_PASSWORD }}
+          TF_VAR_redis_auth_token: ${{ secrets.REDIS_AUTH_TOKEN }}
+
+  ###########################################################################
+  # Apply to Production (manual trigger with GitHub Environment approval)
+  ###########################################################################
+  apply-prod:
+    name: "Apply Production"
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'prod'
+    environment: production  # Requires manual approval from production environment reviewers
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_PROD_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Terraform Init
+        working-directory: infra/terraform/environments/prod
+        run: terraform init
+
+      - name: Terraform Plan (pre-apply check)
+        working-directory: infra/terraform/environments/prod
+        run: |
+          terraform plan \
+            -var-file=terraform.tfvars \
+            -no-color \
+            -out=plan.tfplan
+        env:
+          TF_VAR_db_master_password: ${{ secrets.PROD_DB_MASTER_PASSWORD }}
+          TF_VAR_redis_auth_token: ${{ secrets.PROD_REDIS_AUTH_TOKEN }}
+          TF_VAR_pagerduty_endpoint: ${{ secrets.PAGERDUTY_ENDPOINT }}
+          TF_VAR_slack_webhook_url: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+      - name: Terraform Apply
+        if: github.event.inputs.action == 'apply'
+        working-directory: infra/terraform/environments/prod
+        run: terraform apply plan.tfplan
+
+  ###########################################################################
+  # Security Scan (Checkov)
+  ###########################################################################
+  security-scan:
+    name: "Checkov Security Scan"
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run Checkov
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: infra/terraform/
+          framework: terraform
+          soft_fail: false
+          output_format: github_failed_only
+          skip_check: "CKV_AWS_115,CKV_AWS_116"  # Lambda concurrency limits — not applicable

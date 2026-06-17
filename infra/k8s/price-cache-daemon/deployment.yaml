@@ -1,0 +1,162 @@
+###############################################################################
+# Price Cache Daemon
+#
+# Responsibilities:
+#   - Poll Pyth, Chainlink Data Streams, and Switchboard every 5 seconds
+#   - Write signed price proofs to Redis with 30s TTL
+#   - Emit PRICE_STALE log line if any price exceeds MAX_PRICE_AGE_SECS
+#   - Emit CloudWatch metrics: price_cache_staleness_ms per token
+#
+# This is the most critical background service — all keeper execution
+# depends on having warm prices available. Run 2 replicas.
+###############################################################################
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: price-cache-daemon
+  namespace: gmsol
+  annotations:
+    eks.amazonaws.com/role-arn: "${IRSA_PRICE_CACHE_ROLE_ARN}"
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: price-cache-config
+  namespace: gmsol
+data:
+  RUST_LOG: "info"
+  SOLANA_CLUSTER: "mainnet"
+  STORE_PROGRAM_ID: "Gmso1uvJnLbawvw7yezdfCDcPydwW2s2iqG3w6MDucLo"
+  # Refresh prices every 5s — well within the 30s freshness window
+  PRICE_REFRESH_INTERVAL_SECS: "5"
+  # Alert threshold — log PRICE_STALE if any price exceeds this age
+  MAX_PRICE_AGE_SECS: "20"
+  # Redis TTL for price entries (matches on-chain oracle window)
+  PRICE_TTL_SECS: "30"
+  METRICS_NAMESPACE: "gmsol/keeper"
+  AWS_REGION: "us-east-1"
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: price-cache-daemon
+  namespace: gmsol
+  labels:
+    app: price-cache-daemon
+    component: oracle
+spec:
+  replicas: 2  # Active-active — both write same prices; Redis handles dedup via TTL
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app: price-cache-daemon
+  template:
+    metadata:
+      labels:
+        app: price-cache-daemon
+        component: oracle
+    spec:
+      serviceAccountName: price-cache-daemon
+      nodeSelector:
+        role: keepers
+
+      initContainers:
+        - name: fetch-secrets
+          image: amazon/aws-cli:latest
+          command:
+            - sh
+            - -c
+            - |
+              aws secretsmanager get-secret-value \
+                --secret-id gmsol/rpc/helius-api-key \
+                --query SecretString --output text | jq -r '.api_key' > /secrets/rpc-api-key
+          volumeMounts:
+            - name: secrets
+              mountPath: /secrets
+
+      containers:
+        - name: price-cache-daemon
+          image: "${ECR_REGISTRY}/gmsol/keeper:latest"
+          command: ["gmsol-keeper", "price-cache"]
+
+          envFrom:
+            - configMapRef:
+                name: price-cache-config
+
+          env:
+            - name: SOLANA_RPC_API_KEY_PATH
+              value: /secrets/rpc-api-key
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: redis-connection
+                  key: url
+
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "512Mi"
+            limits:
+              cpu: "1000m"
+              memory: "1Gi"
+
+          volumeMounts:
+            - name: secrets
+              mountPath: /secrets
+              readOnly: true
+
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 9090
+            initialDelaySeconds: 15
+            periodSeconds: 15
+            failureThreshold: 3
+
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 9090
+            initialDelaySeconds: 10
+            periodSeconds: 5
+
+          securityContext:
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 1000
+            allowPrivilegeEscalation: false
+
+      volumes:
+        - name: secrets
+          emptyDir:
+            medium: Memory
+
+---
+# HPA for price cache — scale if fetch latency increases
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: price-cache-daemon-hpa
+  namespace: gmsol
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: price-cache-daemon
+  minReplicas: 2
+  maxReplicas: 4
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
